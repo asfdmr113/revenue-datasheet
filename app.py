@@ -68,17 +68,59 @@ def parse_amount(raw: Any) -> Decimal | None:
         return None
 
 
+def _postgres_secret_get(p, *keys: str):
+    """Read nested secrets without raising if a key is missing (Streamlit Cloud / TOML)."""
+    for k in keys:
+        try:
+            v = p[k]
+        except Exception:
+            continue
+        if v is not None and str(v).strip() != "":
+            return v
+    return None
+
+
 def get_db_engine():
     p = st.secrets.get("postgres")
     if not p:
-        return None, "Konfigurasi [postgres] tidak ditemukan di st.secrets."
+        return None, (
+            "Konfigurasi [postgres] tidak ditemukan di st.secrets. "
+            "Di Streamlit Cloud, tambahkan tabel [postgres] dengan host, user, password, "
+            "atau satu baris database_url (lihat README)."
+        )
     try:
-        user = quote_plus(str(p["user"]))
-        password = quote_plus(str(p["password"]))
-        host = str(p["host"])
-        port = int(p.get("port", 5432))
-        db = str(p.get("database", "postgres"))
-        url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+        raw_url = _postgres_secret_get(
+            p, "database_url", "db_url", "url", "connection_string", "uri"
+        )
+        if raw_url:
+            u = str(raw_url).strip()
+            if u.startswith("postgresql+psycopg2://"):
+                pass
+            elif u.startswith("postgresql://"):
+                u = "postgresql+psycopg2://" + u[len("postgresql://") :]
+            elif u.startswith("postgres://"):
+                u = "postgresql+psycopg2://" + u[len("postgres://") :]
+            else:
+                return None, "[postgres] database_url harus diawali postgresql:// atau postgres://"
+            return create_engine(u, pool_pre_ping=True), None
+
+        user = _postgres_secret_get(p, "user", "username", "db_user")
+        password = _postgres_secret_get(p, "password", "passwd", "db_password")
+        host = _postgres_secret_get(p, "host", "hostname", "db_host")
+        port_raw = _postgres_secret_get(p, "port")
+        dbn = _postgres_secret_get(p, "database", "dbname", "db") or "postgres"
+
+        if not user or not password or not host:
+            return None, (
+                "[postgres] tidak lengkap: butuh host, password, dan user "
+                "(atau username). Supabase memakai user `postgres`. "
+                "Alternatif: satu kunci database_url berisi connection string penuh."
+            )
+
+        port = int(port_raw) if port_raw is not None else 5432
+        user_q = quote_plus(str(user))
+        password_q = quote_plus(str(password))
+        url = f"postgresql+psycopg2://{user_q}:{password_q}@{host}:{port}/{dbn}"
         return create_engine(url, pool_pre_ping=True), None
     except Exception as e:
         return None, f"Gagal membuat koneksi database: {e}"

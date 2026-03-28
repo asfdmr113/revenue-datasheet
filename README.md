@@ -46,6 +46,12 @@ In the Supabase dashboard, open **SQL** → **New query**, then run:
 
 Use the connection details from **Project Settings → Database** for the `[postgres]` block in secrets (host, user, password, port, database).
 
+### Streamlit Community Cloud
+
+In the app’s **Settings → Secrets**, use a **`[postgres]`** table with the same keys as below. The app accepts **`user`** or **`username`**, and optionally a single **`database_url`** (full `postgresql://…` string from Supabase **Connection string** / URI mode) instead of separate host/user/password.
+
+**Supabase:** the database user is almost always **`postgres`**. The password is the **database password** from **Project Settings → Database** (not the `anon` / `service_role` API keys).
+
 ## 5. Configure secrets
 
 Create a folder **`.streamlit`** in the project root (if it does not exist) and add **`secrets.toml`**. This file is listed in [`.gitignore`](.gitignore) and must not be committed.
@@ -59,6 +65,9 @@ port = 5432
 database = "postgres"
 user = "postgres"
 password = "YOUR_DB_PASSWORD"
+
+# Or one line (Session mode URI from Supabase is fine; app adds psycopg2 driver):
+# database_url = "postgresql://postgres:YOUR_PASSWORD@db.YOUR_PROJECT.supabase.co:5432/postgres"
 
 [connections.gsheets]
 spreadsheet = "https://docs.google.com/spreadsheets/d/YOUR_ID/edit"
