@@ -84,6 +84,18 @@ def get_db_engine():
         return None, f"Gagal membuat koneksi database: {e}"
 
 
+def get_dashboard_password() -> str:
+    """Top-level `dashboard_password` or nested `[dashboard] dashboard_password` in secrets.toml."""
+    if "dashboard_password" in st.secrets:
+        return str(st.secrets["dashboard_password"]).strip()
+    nested = st.secrets.get("dashboard")
+    if nested is not None and hasattr(nested, "get"):
+        v = nested.get("dashboard_password")
+        if v is not None:
+            return str(v).strip()
+    return ""
+
+
 def get_supabase_client():
     s = st.secrets.get("supabase")
     if not s:
@@ -595,14 +607,17 @@ def page_entry():
 
 def page_dashboard():
     st.header("Dashboard pemilik")
-    pwd = st.secrets.get("dashboard_password", "")
+    pwd = get_dashboard_password()
     if not pwd:
-        st.warning("Atur `dashboard_password` di .streamlit/secrets.toml untuk mengamankan halaman ini.")
+        st.warning(
+            "Atur password di `.streamlit/secrets.toml`: "
+            "top-level `dashboard_password = \"...\"` **atau** di dalam `[dashboard]` sebagai `dashboard_password`."
+        )
 
     if not st.session_state.owner_ok:
         entered = st.text_input("Password pemilik", type="password", key="owner_pwd")
         if st.button("Masuk", type="primary", use_container_width=True):
-            if entered and str(entered) == str(pwd):
+            if entered and str(entered).strip() == pwd:
                 st.session_state.owner_ok = True
                 st.rerun()
             else:
