@@ -1,0 +1,7 @@
+.streamlit/secrets.toml
+__pycache__/
+SQL/supabase-database.sql
+*.pyc
+.venv/
+venv/
+.env
