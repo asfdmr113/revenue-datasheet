@@ -426,17 +426,36 @@ def load_monthly_aggregates(engine, year: int, month: int) -> tuple[pd.DataFrame
     return df, totals
 
 
+def load_transactions(engine, year: int, month: int) -> pd.DataFrame:
+    start = date(year, month, 1)
+    last = calendar.monthrange(year, month)[1]
+    end = date(year, month, last)
+    q = text(
+        """
+        SELECT id, date, type, category, amount, description
+        FROM transactions
+        WHERE date >= :start AND date <= :end
+        ORDER BY date DESC, id DESC
+        """
+    )
+    with engine.connect() as conn:
+        df = pd.read_sql(q, conn, params={"start": start, "end": end})
+    return df
+
+
 def ensure_session_defaults():
     if "owner_ok" not in st.session_state:
         st.session_state.owner_ok = False
     if "tx_type_radio" not in st.session_state:
         st.session_state.tx_type_radio = "Sale"
+    if "expense_categories_list" not in st.session_state:
+        st.session_state.expense_categories_list = EXPENSE_CATEGORIES.copy()
     if "expense_category" not in st.session_state:
-        st.session_state.expense_category = EXPENSE_CATEGORIES[0]
+        st.session_state.expense_category = st.session_state.expense_categories_list[0]
     if "tx_desc" not in st.session_state:
         st.session_state.tx_desc = ""
-    if "quick_expense_pending" not in st.session_state:
-        st.session_state.quick_expense_pending = None
+    if "expense_cart" not in st.session_state:
+        st.session_state.expense_cart = {}
 
 
 def open_gsheets_connection() -> tuple[GSheetsConnection | None, str | None]:
@@ -477,6 +496,14 @@ def page_entry():
 
     ensure_session_defaults()
 
+    if st.session_state.get("_reset_manual_form"):
+        st.session_state.tx_desc = ""
+        if "custom_expense_category" in st.session_state:
+            del st.session_state["custom_expense_category"]
+        if "_set_expense_category" in st.session_state:
+            st.session_state.expense_category = st.session_state.pop("_set_expense_category")
+        st.session_state._reset_manual_form = False
+
     today = date.today()
     engine_today, _ = get_db_engine()
     if engine_today:
@@ -516,11 +543,7 @@ def page_entry():
         
         if expense_mode == "Quick Add":
             st.subheader("Quick Add Expenses")
-            st.toggle(
-                "Edit price before save",
-                key="edit_quick_price",
-                help="Nyalakan untuk mengubah harga preset sebelum disimpan (misal harga naik hari ini).",
-            )
+            st.caption("Ketuk item untuk memasukkannya ke keranjang. Edit harga atau jumlah jika perlu, lalu simpan sekaligus.")
 
             cols = st.columns(3)
             for i, (item, data) in enumerate(QUICK_EXPENSES.items()):
@@ -528,74 +551,97 @@ def page_entry():
                 slug = "".join(ch if ch.isalnum() else "_" for ch in item)[:48]
                 if col.button(f"➕ {item}", use_container_width=True, key=f"qe_{slug}"):
                     cat = normalize_quick_category(data["cat"])
-                    if st.session_state.get("edit_quick_price"):
-                        st.session_state.quick_expense_pending = {
-                            "item": item,
-                            "cat": cat,
-                            "price": int(data["price"]),
-                        }
-                        st.rerun()
+                    if item in st.session_state.expense_cart:
+                        st.session_state.expense_cart[item]["qty"] += 1
                     else:
-                        amt = parse_amount(data["price"])
-                        if amt is None:
-                            st.error("Harga preset tidak valid.")
-                        else:
-                            gconn, gerr = open_gsheets_connection()
-                            res = save_transaction_dual(
-                                today,
-                                "Expense",
-                                cat,
-                                amt,
-                                item,
-                                gsheets_conn=gconn,
-                                gsheets_connect_error=gerr,
-                            )
-                            feedback_dual_save(res, item)
-                            if res["postgres"] or res["sheets"]:
-                                st.rerun()
+                        st.session_state.expense_cart[item] = {
+                            "cat": cat,
+                            "price": float(data["price"]),
+                            "qty": 1
+                        }
+                    st.rerun()
 
-            pending = st.session_state.quick_expense_pending
-            if pending:
-                pend_slug = "".join(ch if ch.isalnum() else "_" for ch in pending["item"])[:40]
-                st.info(f"**Konfirmasi harga** — _{pending['item']}_")
-                with st.form("confirm_quick_expense_price"):
-                    new_amt = st.number_input(
-                        "Jumlah (IDR)",
+            cart = st.session_state.expense_cart
+            if cart:
+                st.divider()
+                st.subheader("🛒 Keranjang Pengeluaran")
+
+                hc1, hc2, hc3, hc4 = st.columns([4, 3, 2, 1])
+                hc1.caption("Item")
+                hc2.caption("Harga Satuan (IDR)")
+                hc3.caption("Qty")
+
+                total = 0.0
+                items_to_delete = []
+
+                for cart_item_name, cart_data in cart.items():
+                    c1, c2, c3, c4 = st.columns([4, 3, 2, 1])
+                    c1.markdown(f"<div style='margin-top: 8px; font-weight: 500;'>{cart_item_name}</div>", unsafe_allow_html=True)
+
+                    new_price = c2.number_input(
+                        "Harga",
                         min_value=0.0,
-                        value=float(pending["price"]),
+                        value=float(cart_data["price"]),
                         step=1000.0,
                         format="%.0f",
-                        key=f"qe_amt_{pend_slug}",
+                        key=f"cart_price_{cart_item_name}",
+                        label_visibility="collapsed"
                     )
-                    bc1, bc2 = st.columns(2)
-                    with bc1:
-                        submitted = st.form_submit_button("Simpan", type="primary", use_container_width=True)
-                    with bc2:
-                        cancelled = st.form_submit_button("Batal", use_container_width=True)
 
-                    if cancelled:
-                        st.session_state.quick_expense_pending = None
-                        st.rerun()
+                    new_qty = c3.number_input(
+                        "Qty",
+                        min_value=1,
+                        value=int(cart_data["qty"]),
+                        step=1,
+                        key=f"cart_qty_{cart_item_name}",
+                        label_visibility="collapsed"
+                    )
 
-                    if submitted:
-                        amt = parse_amount(new_amt)
-                        if amt is None or amt == 0:
-                            st.error("Masukkan jumlah lebih dari 0.")
-                        else:
-                            gconn, gerr = open_gsheets_connection()
+                    cart_data["price"] = new_price
+                    cart_data["qty"] = new_qty
+                    total += new_price * new_qty
+
+                    if c4.button("❌", key=f"cart_del_{cart_item_name}"):
+                        items_to_delete.append(cart_item_name)
+
+                for item_to_del in items_to_delete:
+                    del st.session_state.expense_cart[item_to_del]
+                if items_to_delete:
+                    st.rerun()
+
+                st.markdown(f"<h4 style='text-align: right;'>Total: {format_idr(total)}</h4>", unsafe_allow_html=True)
+
+                if st.button("Simpan Semua Pengeluaran", type="primary", use_container_width=True):
+                    gconn, gerr = open_gsheets_connection()
+                    success_count = 0
+                    error_count = 0
+
+                    for cart_item_name, cart_data in cart.items():
+                        amt = parse_amount(cart_data["price"] * cart_data["qty"])
+                        if amt and amt > 0:
+                            desc = f"{cart_item_name} (x{cart_data['qty']})" if cart_data['qty'] > 1 else cart_item_name
                             res = save_transaction_dual(
                                 today,
                                 "Expense",
-                                pending["cat"],
+                                cart_data["cat"],
                                 amt,
-                                pending["item"],
+                                desc,
                                 gsheets_conn=gconn,
                                 gsheets_connect_error=gerr,
                             )
-                            st.session_state.quick_expense_pending = None
-                            feedback_dual_save(res, pending["item"])
                             if res["postgres"] or res["sheets"]:
-                                st.rerun()
+                                success_count += 1
+                            else:
+                                error_count += 1
+                                feedback_dual_save(res, cart_item_name)
+
+                    if success_count > 0:
+                        st.toast(f"{success_count} pengeluaran tersimpan!", icon="✅")
+                        st.session_state.expense_cart = {}
+                        st.session_state._reset_manual_form = True
+                        st.rerun()
+                    elif error_count > 0:
+                        st.error("Gagal menyimpan beberapa pengeluaran.")
         else:
             show_manual_form = True
     else:
@@ -607,9 +653,11 @@ def page_entry():
         if tx_type == "Expense":
             category = st.selectbox(
                 "Kategori pengeluaran",
-                EXPENSE_CATEGORIES,
+                st.session_state.expense_categories_list,
                 key="expense_category",
             )
+            if category == "Others":
+                st.text_input("Nama kategori baru", key="custom_expense_category")
 
         amt = st.number_input(
             "Jumlah (IDR)",
@@ -629,12 +677,28 @@ def page_entry():
                 st.error("Masukkan jumlah lebih dari 0.")
                 return
 
+            actual_category = None
+            if tx_type == "Expense":
+                if category == "Others" and st.session_state.get("custom_expense_category"):
+                    new_cat = st.session_state.custom_expense_category.strip()
+                    if new_cat:
+                        actual_category = new_cat
+                        if actual_category not in st.session_state.expense_categories_list:
+                            if "Others" in st.session_state.expense_categories_list:
+                                idx = st.session_state.expense_categories_list.index("Others")
+                                st.session_state.expense_categories_list.insert(idx, actual_category)
+                            else:
+                                st.session_state.expense_categories_list.append(actual_category)
+                            st.session_state._set_expense_category = actual_category
+                if not actual_category:
+                    actual_category = category
+
             gsheets_conn, gsheets_err = open_gsheets_connection()
 
             res = save_transaction_dual(
                 tx_date,
                 tx_type,
-                category if tx_type == "Expense" else None,
+                actual_category,
                 amount,
                 desc.strip() or None,
                 gsheets_conn=gsheets_conn,
@@ -643,7 +707,7 @@ def page_entry():
 
             feedback_dual_save(res, "Transaksi")
             if res["postgres"] or res["sheets"]:
-                st.session_state.tx_desc = ""
+                st.session_state._reset_manual_form = True
                 st.rerun()
 
 
@@ -781,6 +845,108 @@ def page_dashboard():
     )
     fig.update_yaxes(tickprefix="Rp ")
     st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("Edit Data Transaksi")
+    st.caption("Perubahan di sini akan langsung disimpan ke database PostgreSQL. (Perubahan ini tidak otomatis tersinkronisasi ke Google Sheets)")
+
+    try:
+        df_tx = load_transactions(engine, year_i, month_i)
+    except Exception as e:
+        st.warning(f"Gagal memuat detail transaksi: {e}")
+        return
+
+    if not df_tx.empty:
+        df_tx["date"] = pd.to_datetime(df_tx["date"]).dt.date
+        df_tx["amount"] = df_tx["amount"].astype(float)
+
+    st.data_editor(
+        df_tx,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "id": st.column_config.NumberColumn("ID", disabled=True),
+            "date": st.column_config.DateColumn("Tanggal", required=True),
+            "type": st.column_config.SelectboxColumn("Tipe", options=["Sale", "Expense"], required=True),
+            "category": st.column_config.TextColumn("Kategori"),
+            "amount": st.column_config.NumberColumn("Jumlah", min_value=0.0, step=1000.0, required=True),
+            "description": st.column_config.TextColumn("Keterangan"),
+        },
+        key="tx_data_editor"
+    )
+
+    if st.button("Simpan Perubahan Database", type="primary"):
+        changes = st.session_state.tx_data_editor
+        added = changes.get("added_rows", [])
+        edited = changes.get("edited_rows", {})
+        deleted = changes.get("deleted_rows", [])
+
+        if not added and not edited and not deleted:
+            st.info("Tidak ada perubahan yang perlu disimpan.")
+        else:
+            try:
+                orig_ids = df_tx["id"].tolist() if not df_tx.empty else []
+                with engine.begin() as conn:
+                    for d_idx in deleted:
+                        conn.execute(text("DELETE FROM transactions WHERE id = :id"), {"id": orig_ids[d_idx]})
+
+                    for row_idx_str, col_changes in edited.items():
+                        row_idx = int(row_idx_str)
+                        row_id = orig_ids[row_idx]
+                        if col_changes:
+                            set_clauses = []
+                            params = {"id": row_id}
+                            for col_name, new_val in col_changes.items():
+                                set_clauses.append(f"{col_name} = :{col_name}")
+                                params[col_name] = new_val
+                            if set_clauses:
+                                sql = f"UPDATE transactions SET {', '.join(set_clauses)} WHERE id = :id"
+                                conn.execute(text(sql), params)
+
+                    for row_data in added:
+                        dt = row_data.get("date", date.today().isoformat())
+                        typ = row_data.get("type", "Sale")
+                        cat = row_data.get("category", None)
+                        amt = row_data.get("amount", 0.0)
+                        desc = row_data.get("description", None)
+                        conn.execute(
+                            text("INSERT INTO transactions (date, type, category, amount, description) VALUES (:dt, :typ, :cat, :amt, :desc)"),
+                            {"dt": dt, "typ": typ, "cat": cat, "amt": amt, "desc": desc}
+                        )
+                st.success("Perubahan berhasil disimpan ke database!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Gagal menyimpan perubahan: {e}")
+                st.code(traceback.format_exc(), language="text")
+
+    st.divider()
+    st.subheader("Hapus Transaksi")
+    st.caption("Pilih transaksi di bawah ini untuk menghapusnya secara instan (alternatif: Anda juga bisa memilih baris di editor atas lalu menekan ikon tempat sampah).")
+
+    if not df_tx.empty:
+        tx_options = []
+        for _, row in df_tx.iterrows():
+            cat = row['category'] if pd.notna(row['category']) and row['category'] else '-'
+            tx_options.append(f"ID {row['id']} | {row['date']} | {row['type']} | {cat} | {format_idr(row['amount'])}")
+            
+        selected_to_delete = st.selectbox(
+            "Pilih transaksi untuk dihapus:",
+            ["-- Pilih Transaksi --"] + tx_options,
+            key="delete_tx_selectbox"
+        )
+        
+        if st.button("🗑️ Hapus Baris Terpilih", use_container_width=True):
+            if selected_to_delete == "-- Pilih Transaksi --":
+                st.warning("Silakan pilih transaksi dari menu di atas terlebih dahulu.")
+            else:
+                del_id = int(selected_to_delete.split(" ")[1])
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("DELETE FROM transactions WHERE id = :id"), {"id": del_id})
+                    st.success(f"Transaksi ID {del_id} berhasil dihapus dari database!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Gagal menghapus: {e}")
 
 
 def main():
